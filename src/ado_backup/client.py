@@ -323,6 +323,147 @@ class ADOClient:
         except ADOError:
             return []
 
+    def patch(
+        self,
+        url: str,
+        body: list | dict,
+        params: Optional[dict] = None,
+        content_type: str = "application/json",
+    ) -> Any:
+        """PATCH with retry/backoff. Use content_type='application/json-patch+json' for work items."""
+        _params = {"api-version": API_VERSION}
+        if params:
+            _params.update(params)
+        headers = dict(self._headers)
+        headers["Content-Type"] = content_type
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                resp = self._http.patch(url, params=_params, headers=headers, json=body)
+            except httpx.RequestError as exc:
+                if attempt == MAX_RETRIES:
+                    raise ADOError(f"Network error: {exc}") from exc
+                self._sleep_backoff(attempt)
+                continue
+
+            request_id = resp.headers.get("x-ms-request-id", "")
+
+            if resp.status_code in (200, 201):
+                return resp.json()
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                self._sleep_backoff(attempt)
+                continue
+
+            raise ADOError(
+                f"HTTP {resp.status_code} PATCH {url} (x-ms-request-id: {request_id}): {resp.text[:300]}",
+                status_code=resp.status_code,
+                request_id=request_id,
+            )
+
+        raise ADOError(f"Exhausted retries for PATCH {url}")
+
+    def put(self, url: str, body: dict, params: Optional[dict] = None) -> Any:
+        """PUT JSON body, return parsed response."""
+        _params = {"api-version": API_VERSION}
+        if params:
+            _params.update(params)
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                resp = self._http.put(url, params=_params, headers=self._headers, json=body)
+            except httpx.RequestError as exc:
+                if attempt == MAX_RETRIES:
+                    raise ADOError(f"Network error: {exc}") from exc
+                self._sleep_backoff(attempt)
+                continue
+
+            request_id = resp.headers.get("x-ms-request-id", "")
+
+            if resp.status_code in (200, 201):
+                return resp.json()
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                self._sleep_backoff(attempt)
+                continue
+
+            raise ADOError(
+                f"HTTP {resp.status_code} PUT {url} (x-ms-request-id: {request_id}): {resp.text[:300]}",
+                status_code=resp.status_code,
+                request_id=request_id,
+            )
+
+        raise ADOError(f"Exhausted retries for PUT {url}")
+
+    def delete(self, url: str, params: Optional[dict] = None) -> None:
+        """DELETE a resource."""
+        _params = {"api-version": API_VERSION}
+        if params:
+            _params.update(params)
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                resp = self._http.delete(url, params=_params, headers=self._headers)
+            except httpx.RequestError as exc:
+                if attempt == MAX_RETRIES:
+                    raise ADOError(f"Network error: {exc}") from exc
+                self._sleep_backoff(attempt)
+                continue
+
+            if resp.status_code in (200, 204):
+                return
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                self._sleep_backoff(attempt)
+                continue
+
+            raise ADOError(
+                f"HTTP {resp.status_code} DELETE {url}",
+                status_code=resp.status_code,
+            )
+
+        raise ADOError(f"Exhausted retries for DELETE {url}")
+
+    def create_project(self, name: str, description: str = "", process_template_id: str = "") -> dict:
+        """Create an ADO project. Polls until it finishes (async operation)."""
+        url = self._dev_url("_apis/projects")
+        body: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "visibility": "private",
+            "capabilities": {
+                "versioncontrol": {"sourceControlType": "Git"},
+                "processTemplate": {
+                    "templateTypeId": process_template_id or "6b724908-ef14-45cf-84f8-768b5384da45"  # Agile
+                },
+            },
+        }
+        result = self.post(url, body)
+        # ADO project creation is async — poll the operation
+        op_url = result.get("url", "")
+        if op_url:
+            self._poll_operation(op_url)
+        # Return the newly created project
+        proj_url = self._dev_url(f"_apis/projects/{name}")
+        return self.get(proj_url)
+
+    def _poll_operation(self, op_url: str, timeout: int = 120) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                result = self._http.get(op_url, params={"api-version": API_VERSION}, headers=self._headers)
+                if result.status_code == 200:
+                    data = result.json()
+                    status = data.get("status", "")
+                    if status in ("succeeded", "failed", "cancelled"):
+                        if status != "succeeded":
+                            raise ADOError(f"Async operation {status}: {data}")
+                        return
+            except httpx.RequestError:
+                pass
+            time.sleep(3)
+        raise ADOError(f"Async operation timed out after {timeout}s: {op_url}")
+
     def _sleep_backoff(self, attempt: int):
         wait = BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
         log.debug("Backoff %.2fs (attempt %d)", wait, attempt + 1)

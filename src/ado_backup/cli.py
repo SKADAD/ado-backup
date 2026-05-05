@@ -237,6 +237,108 @@ def verify_cmd(
     raise typer.Exit(0)
 
 
+@app.command(name="restore")
+def restore_cmd(
+    archive: Path = typer.Argument(..., help="Path to backup ZIP archive or unpacked directory"),
+    org: str = typer.Option(..., "--org", help="Target ADO organization name or URL"),
+    pat: Optional[str] = typer.Option(None, "--pat", help="Personal Access Token (or AZURE_DEVOPS_PAT)"),
+    use_az_cli: bool = typer.Option(False, "--use-az-cli", help="Authenticate via Azure CLI"),
+    service_principal: bool = typer.Option(False, "--service-principal", help="Authenticate via service principal"),
+    projects: Optional[str] = typer.Option(None, "--projects", help="Comma-separated project names to restore (default: all)"),
+    categories: Optional[str] = typer.Option(
+        None, "--categories",
+        help=f"Comma-separated categories to restore (default: all). Choices: repositories, work-items, pipelines, wikis, boards, artifacts, test-plans",
+    ),
+    map_project: Optional[list[str]] = typer.Option(
+        None, "--map-project",
+        help='Rename a project on restore: "SourceName=TargetName". Can be specified multiple times.',
+    ),
+    create_projects: bool = typer.Option(True, "--create-projects/--no-create-projects", help="Create target project if it doesn't exist"),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing resources"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview what would be restored without doing it"),
+    concurrency: int = typer.Option(4, "--concurrency", help="Parallel project workers"),
+    log_format: str = typer.Option("text", "--log-format", help="Log format: text or json"),
+    log_level: str = typer.Option("INFO", "--log-level", help="Log level"),
+):
+    """Restore a backup archive into an Azure DevOps organization.
+
+    Restores all or selected projects from a ZIP produced by `ado-backup backup`.
+    Repositories are restored via git push --mirror. Work items are re-created
+    with a two-pass strategy (create → link relations). Pipelines, wikis, boards,
+    artifacts, and test plans are recreated via the ADO REST API.
+
+    Note: Secret variable values, service connection credentials, and other
+    write-protected secrets cannot be restored and must be re-entered manually.
+    """
+    from ado_backup.auth import AuthError
+    from ado_backup.config import RestoreConfig
+    from ado_backup.restore_runner import run_restore
+    from ado_backup.restore_report import RestoreReport
+
+    if not archive.exists():
+        typer.echo(f"ERROR: Archive not found: {archive}", err=True)
+        raise typer.Exit(1)
+
+    project_list = [p.strip() for p in projects.split(",") if p.strip()] if projects else []
+    category_list = [c.strip() for c in categories.split(",") if c.strip()] if categories else []
+
+    # Parse --map-project "Source=Target" pairs
+    project_map: dict[str, str] = {}
+    for mapping in (map_project or []):
+        if "=" not in mapping:
+            typer.echo(f"ERROR: --map-project must be in 'Source=Target' format, got: {mapping}", err=True)
+            raise typer.Exit(1)
+        src, _, tgt = mapping.partition("=")
+        project_map[src.strip()] = tgt.strip()
+
+    config = RestoreConfig.from_env_and_args(
+        org=org,
+        archive=str(archive),
+        pat=pat,
+        use_az_cli=use_az_cli,
+        use_service_principal=service_principal,
+        projects=project_list,
+        categories=category_list,
+        project_map=project_map,
+        create_projects=create_projects,
+        force=force,
+        dry_run=dry_run,
+        concurrency=concurrency,
+        log_format=log_format,
+        log_level=log_level,
+    )
+
+    # Place restore report alongside the archive
+    report_path = Path(str(archive).replace(".zip", "") + "-restore-report.json")
+    _setup_logging(log_format, log_level, None)
+    log = logging.getLogger("ado_backup.cli")
+
+    log.info("ado-backup restore starting — org=%s archive=%s", config.org, archive)
+
+    try:
+        from ado_backup.auth import build_request_headers
+        if not dry_run:
+            build_request_headers(config)
+    except AuthError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(1)
+
+    report = RestoreReport(config.org, config, report_path)
+    exit_code = run_restore(config, report)
+    summary = report.finalize()
+
+    typer.echo(
+        f"Restore {'(dry-run) ' if dry_run else ''}complete — "
+        f"projects={summary['total_projects']}, "
+        f"errors={summary['errors']}, "
+        f"warnings={summary['warnings']}"
+    )
+    if not dry_run:
+        typer.echo(f"Report: {report_path}")
+
+    raise typer.Exit(exit_code)
+
+
 # Make `ado-backup` (no subcommand) run the backup command
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):

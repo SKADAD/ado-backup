@@ -1,6 +1,6 @@
 # ado-backup
 
-A production-grade backup tool for Azure DevOps. Given credentials and an organization, it produces a timestamped ZIP archive containing everything that can be exported from Azure DevOps via its public REST APIs: Git repositories (full history via `--mirror`), work items with attachments, pipelines, wikis, boards, dashboards, artifacts, and test plans.
+A production-grade backup **and restore** tool for Azure DevOps. Given credentials and an organization, it produces a timestamped ZIP archive containing everything that can be exported from Azure DevOps via its public REST APIs: Git repositories (full history via `--mirror`), work items with attachments, pipelines, wikis, boards, dashboards, artifacts, and test plans. The same archive can be used to restore into any Azure DevOps organization.
 
 ---
 
@@ -21,6 +21,25 @@ ado-backup backup --org my-org --pat $PAT --projects "ProjectA,ProjectB"
 
 # Verify a produced archive
 ado-backup verify ado-backup-my-org-20240101T000000Z.zip
+
+# Restore everything to the same (or a different) org
+ado-backup restore ado-backup-my-org-20240101T000000Z.zip \
+  --org target-org --pat $AZURE_DEVOPS_PAT
+
+# Restore only specific projects
+ado-backup restore backup.zip --org target-org --pat $PAT \
+  --projects "ProjectA,ProjectB"
+
+# Restore only repositories and work items
+ado-backup restore backup.zip --org target-org --pat $PAT \
+  --categories "repositories,work-items"
+
+# Rename a project on restore (restore "OldName" as "NewName")
+ado-backup restore backup.zip --org target-org --pat $PAT \
+  --map-project "OldName=NewName"
+
+# Preview what would be restored without making any changes
+ado-backup restore backup.zip --org target-org --pat $PAT --dry-run
 ```
 
 The archive is written to `./backups/ado-backup-<org>-<timestamp>.zip` by default.
@@ -213,20 +232,83 @@ See [pipelines/azure-pipelines.yml](pipelines/azure-pipelines.yml) for a ready-t
 
 ---
 
-## Restore guidance
+## Restore
 
-This tool is a backup tool, not a restore tool. The backup format is designed to be usable with each ADO API's import/migration endpoints:
+`ado-backup restore` reads a backup archive and recreates the backed-up resources in any target ADO organization.
 
-| Data | Restore path |
-|------|-------------|
-| Git repos | `git push --mirror` to a new ADO repo |
-| Work items | Work Items - Create REST API; consider azure-devops-migration-tools |
-| Build definitions | Definitions - Create REST API |
-| Release definitions | Release Management REST API |
-| Wikis | `git push --mirror` to a new wiki repo |
-| Test plans | Test Plan - Create REST API |
+### What gets restored
 
-See [docs/restore-guide.md](docs/restore-guide.md) for more detail.
+| Category | How | Notes |
+|----------|-----|-------|
+| Git repositories | `git push --mirror` | All branches, tags, full history |
+| Work items | ADO PATCH API (two-pass) | Pass 1: create items; Pass 2: re-link relations with remapped IDs |
+| WI comments | ADO comments API | Prefixed with original author/date |
+| WI attachments | Upload + link | Binaries re-uploaded |
+| Build definitions | POST /build/definitions | Agent pool names preserved; IDs will differ |
+| Release definitions | POST /release/definitions | |
+| YAML pipelines | POST /pipelines | Repository must be restored first |
+| Variable groups | POST /variablegroups | **Secret values are not restored — re-enter manually** |
+| Task groups | POST /taskgroups | |
+| Environments | POST /environments | |
+| Wikis | `git push --mirror` | Both project and code wikis |
+| Teams | POST /teams | |
+| Dashboards | POST /dashboards | Widget live-data references will not work until reconfigured |
+| Artifact feeds | POST /packaging/feeds | Package binaries not re-published automatically |
+| Test plans/suites | POST /testplan/plans | |
+| Test cases | Linked from restored work items | Requires work-items category to run first |
+
+### Restore CLI reference
+
+```
+ado-backup restore ARCHIVE --org TARGET_ORG [OPTIONS]
+
+Arguments:
+  ARCHIVE                       ZIP archive or unpacked directory [required]
+
+Options:
+  --org TEXT                    Target organization name or URL [required]
+  --pat / AZURE_DEVOPS_PAT      Auth token
+  --projects TEXT               Comma-separated projects to restore (default: all)
+  --categories TEXT             Comma-separated categories (default: all)
+                                repositories, work-items, pipelines, wikis,
+                                boards, artifacts, test-plans
+  --map-project TEXT            Rename on restore: "Source=Target"
+                                (repeatable)
+  --create-projects             Create project if it doesn't exist [default: on]
+  --no-create-projects          Require target project to pre-exist
+  --force                       Overwrite existing resources
+  --dry-run                     Preview without making changes
+  --concurrency INT             Parallel project workers [default: 4]
+  --log-format text|json        [default: text]
+  --log-level TEXT              [default: INFO]
+```
+
+### Work item IDs
+
+ADO assigns new IDs when work items are recreated. The restore process:
+1. Creates all items in ID order (so parents exist before children).
+2. Builds an old→new ID mapping.
+3. Re-adds all work item relations using remapped IDs.
+4. Passes the mapping to the test plans restorer so test cases reference the right items.
+
+The ID mapping is not persisted to disk by default. If you need it for post-restore scripting, run with `--log-level DEBUG` and capture the log.
+
+### Secrets
+
+The following are **not** restored and must be re-entered manually after restore:
+
+- Secret variable values in variable groups
+- Service connection credentials
+- Agent registration tokens
+- Key Vault-linked variable values
+
+See [docs/what-is-not-backed-up.md](docs/what-is-not-backed-up.md) for the full list.
+
+### Restore report
+
+After each restore run, a `<archive-name>-restore-report.json` is written alongside the archive. It records what was restored, what was skipped, and any errors — the same format as the backup manifest.
+
+See [docs/restore-guide.md](docs/restore-guide.md) for per-category restore details and common troubleshooting.
 
 ---
 
