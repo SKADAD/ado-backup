@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: ado-backup
+Version: 1.0.0
+Summary: Comprehensive backup tool for Azure DevOps organizations
+Author: ado-backup contributors
+License: MIT
+Keywords: azure,devops,backup,git
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: httpx>=0.27
+Requires-Dist: typer>=0.12
+Requires-Dist: rich>=13
+Requires-Dist: msal>=1.28
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+Requires-Dist: pytest-mock>=3.14; extra == "dev"
+Requires-Dist: respx>=0.21; extra == "dev"
+
+# ado-backup
