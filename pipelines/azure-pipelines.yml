@@ -1,0 +1,95 @@
+# Azure DevOps Backup Pipeline
+#
+# Prerequisites:
+#   1. Store your PAT (or use System.AccessToken for single-project) in a
+#      variable group named "ado-backup-secrets" with variable AZURE_DEVOPS_PAT.
+#   2. (Optional) Set BACKUP_BLOB_CONTAINER_URL to upload to Azure Blob Storage.
+#
+# To enable nightly schedule, uncomment the `schedules:` block below.
+
+trigger: none    # manual trigger only (or set to your branch)
+
+# schedules:
+# - cron: "0 2 * * *"    # 02:00 UTC every night
+#   displayName: Nightly backup
+#   branches:
+#     include:
+#       - main
+#   always: true          # run even if no code changes
+
+variables:
+  - group: ado-backup-secrets  # must contain AZURE_DEVOPS_PAT
+  # Optional: override these at queue time or in the variable group
+  - name: ADO_ORG
+    value: "$(System.TeamFoundationCollectionUri)"  # auto-populated by ADO
+  - name: OUTPUT_DIR
+    value: "$(Build.ArtifactStagingDirectory)/backups"
+  - name: CONCURRENCY
+    value: "4"
+  - name: LOG_FORMAT
+    value: "json"
+  # Set to a SAS URL to upload the archive to Azure Blob Storage after backup
+  # Example: https://mystorageaccount.blob.core.windows.net/backups?<sas-token>
+  - name: BACKUP_BLOB_CONTAINER_URL
+    value: ""
+
+pool:
+  vmImage: "ubuntu-latest"
+
+steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: "3.11"
+    displayName: "Use Python 3.11"
+
+  - script: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    displayName: "Install dependencies"
+
+  - script: |
+      python -m ado_backup backup \
+        --org "$(ADO_ORG)" \
+        --pat "$(AZURE_DEVOPS_PAT)" \
+        --output-dir "$(OUTPUT_DIR)" \
+        --concurrency "$(CONCURRENCY)" \
+        --log-format "$(LOG_FORMAT)" \
+        --log-level INFO
+    displayName: "Run ado-backup"
+    env:
+      # Expose the PAT as env var in addition to --pat flag for sub-processes (git)
+      AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+
+  # Verify the archive
+  - script: |
+      ZIP=$(ls $(OUTPUT_DIR)/*.zip | head -1)
+      echo "Verifying archive: $ZIP"
+      python -m ado_backup verify "$ZIP"
+    displayName: "Verify archive"
+
+  # Publish as pipeline artifact
+  - task: PublishPipelineArtifact@1
+    inputs:
+      targetPath: "$(OUTPUT_DIR)"
+      artifact: "ado-backup"
+      publishLocation: "pipeline"
+    displayName: "Publish backup artifact"
+    condition: always()  # publish even if backup had warnings
+
+  # Optional: Upload to Azure Blob Storage
+  - script: |
+      if [ -n "$(BACKUP_BLOB_CONTAINER_URL)" ]; then
+        ZIP=$(ls $(OUTPUT_DIR)/*.zip | head -1)
+        FILENAME=$(basename "$ZIP")
+        echo "Uploading $FILENAME to Blob Storage..."
+        curl -X PUT \
+          -H "x-ms-blob-type: BlockBlob" \
+          -H "Content-Type: application/zip" \
+          --data-binary @"$ZIP" \
+          "$(BACKUP_BLOB_CONTAINER_URL)/$FILENAME"
+        echo "Upload complete."
+      else
+        echo "BACKUP_BLOB_CONTAINER_URL not set; skipping Blob Storage upload."
+      fi
+    displayName: "Upload to Azure Blob Storage (optional)"
+    condition: succeeded()
